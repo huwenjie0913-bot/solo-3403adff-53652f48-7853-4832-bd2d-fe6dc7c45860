@@ -53,14 +53,20 @@ const Review = (() => {
       data = await API.get(`/api/plans/${app.activePlan}/reviews/${cid}`);
     } catch (e) { toast('载入失败：' + e.message); modal.classList.add('hidden'); return; }
 
-    let adjustments, status = 'pending', note = '', savedResult = null;
+    let status = 'pending', note = '', savedResult = null;
+    let adjustments;
     if (data.review) {
       adjustments = data.review.adjustments || {};
       status = data.review.status; note = data.review.note || '';
       savedResult = data.review.result || {};
+    } else {
+      // 未复核：用接口给出的默认调整（自动接缝起止锚点、无异常区段）初始化
+      adjustments = {
+        anchors: data.default_adj?.anchors || [],
+        zones: [],
+      };
     }
-    const anchors = adjustments.anchors ? clone(adjustments.anchors)
-      : (data.default_adj?.anchors ? clone(data.default_adj.anchors) : []);
+    const anchors = adjustments.anchors ? clone(adjustments.anchors) : [];
     const zones = adjustments.zones ? clone(adjustments.zones) : [];
 
     st = {
@@ -409,9 +415,9 @@ const Review = (() => {
     ctx.fillRect(0, 0, g.W, g.H);
     paintRibbon('a', g.ay0, g.ay1, g);
     paintRibbon('b', g.by0, g.by1, g);
-    paintGap(g);
-    paintZones(g, false);
-    paintAnchorKnobs(g);
+    paintGap(g, ctx);
+    paintZones(g, false, ctx);
+    paintAnchorKnobs(g, ctx);
   }
 
   function paintRibbon(side, y0, y1, g, targetCtx, targetW) {
@@ -564,7 +570,7 @@ const Review = (() => {
     c2.restore();
   }
 
-  function paintGap(g) {
+  function paintGap(g, c2) {
     // 对应连线（每个锚点一条）与 u 刻度
     c2.strokeStyle = 'rgba(127,182,232,.5)'; c2.lineWidth = 1;
     c2.fillStyle = '#7f93a8'; c2.font = '10px sans-serif';
@@ -588,7 +594,8 @@ const Review = (() => {
     }
   }
 
-  function paintZones(g, forPrint) {
+  function paintZones(g, forPrint, c2) {
+    c2 = c2 || ctx;
     st.zones.forEach((z, zi) => {
       const x0 = uToX(Math.min(z.u0, z.u1)), x1 = uToX(Math.max(z.u0, z.u1));
       const meta = ZONE_META[z.kind] || ZONE_META.other;
@@ -606,16 +613,17 @@ const Review = (() => {
     });
   }
 
-  function paintAnchorKnobs(g) {
+  function paintAnchorKnobs(g, c2) {
+    c2 = c2 || ctx;
     st.anchors.forEach((a, k) => {
       const x = uToX(a.u);
       if (x < g.padX - 8 || x > g.W - g.padX + 8) return;
       const isEnd = k === 0 || k === st.anchors.length - 1;
-      knob(x, g.ay1, isEnd ? '#ffd35c' : '#7fe08a', isEnd ? 6 : 5, isEnd ? 'square' : 'diamond');
-      knob(x, g.by0, isEnd ? '#ffd35c' : '#7fe08a', isEnd ? 6 : 5, isEnd ? 'square' : 'diamond');
+      knob(c2, x, g.ay1, isEnd ? '#ffd35c' : '#7fe08a', isEnd ? 6 : 5, isEnd ? 'square' : 'diamond');
+      knob(c2, x, g.by0, isEnd ? '#ffd35c' : '#7fe08a', isEnd ? 6 : 5, isEnd ? 'square' : 'diamond');
     });
   }
-  function knob(x, y, color, r, shape) {
+  function knob(c2, x, y, color, r, shape) {
     c2.fillStyle = color; c2.strokeStyle = '#1c2026'; c2.lineWidth = 1.5;
     c2.beginPath();
     if (shape === 'square') c2.rect(x - r, y - r, r * 2, r * 2);
