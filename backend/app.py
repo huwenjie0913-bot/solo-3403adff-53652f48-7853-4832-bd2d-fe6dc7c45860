@@ -1,13 +1,17 @@
 """Flask 入口：文物陶瓷碎片整理工作台，所有接口仅监听本机。"""
 from __future__ import annotations
 
-import io
+import io  # noqa: F401  (保留给后续导出接口)
 import json
 import os
+import sys
 import threading
+from pathlib import Path
 
 import numpy as np
 from flask import Flask, jsonify, request, send_file, send_from_directory
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from database import get_db, init_db
 import vision
@@ -164,7 +168,7 @@ def upload_fragments(pid):
         db.close()
         return jsonify({"error": "项目不存在"}), 404
     existing = db.execute(
-        "SELECT COUNT(*) c FROM fragment WHERE project_id=?", (pid)).fetchone()["c"]
+        "SELECT COUNT(*) c FROM fragment WHERE project_id=?", (pid,)).fetchone()["c"]
     created = []
     errors = []
     for i, fs in enumerate(files):
@@ -430,6 +434,8 @@ def run_match(pid):
                                 ensure_ascii=False),
                      json.dumps({"R": res["R"], "t": res["t"],
                                  "ia": ia, "ib": ib,
+                                 "seam_center_a": res["seam_center_a"],
+                                 "seam_center_b": res["seam_center_b"],
                                  "reflected": res["reflected"]}),
                      f"{min(ia)}-{max(ia)}", f"{min(ib)}-{max(ib)}",
                      round(res["run_points"] / n, 3)))

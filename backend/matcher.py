@@ -68,52 +68,55 @@ def contact_stats(poly_a: np.ndarray, poly_b_mapped: np.ndarray,
 
 def seam_verify(ca: np.ndarray, cb: np.ndarray, ia: np.ndarray,
                 ib: np.ndarray, R: np.ndarray, seam_center: np.ndarray,
-                max_extend: int = 130, gap_mm: float = 2.5) -> dict:
+                max_extend: int = 150, gap_mm: float = 3.0) -> dict:
     """以候选 (ia,ib) 为种子，沿参数方向有序延伸接缝并验证。
 
-    B 轮廓按 (去质心) R 平移映射到世界系；延伸方向上保持
-    a 索引 +1 / b 索引 -1（互补边走向相反），直到间距超过 gap_mm。
-    返回接触长度、接触段上的逐点转角 NCC 与平均间距。
+    步骤：
+      1. 种子变换下向两侧延伸（a +1 / b -1），收集间距 < gap_mm 的点对；
+      2. 在全部接触点对上重新做一次刚性拟合，得到整段接缝 RMSE；
+      3. 用重拟合后的映射再核对平均间距与反对向。
+    返回接触长度、重拟合 RMSE、平均间隙、接触弧累计转角。
     """
     n = len(ca)
-    center_b = cb[ib].mean(axis=0)
+    center_b0 = cb[ib].mean(axis=0)
 
-    def map_b(idx):
-        return (cb[idx] - center_b) @ R.T + seam_center
+    def map_b(idx, Rr, cc):
+        return (cb[idx] - cc) @ Rr.T + seam_center
 
-    pair_a, pair_b = [], []
-    seed_mid = len(ia) // 2
-    for step in range(max_extend):
-        for sgn in (1, -1):
-            ai = (ia[seed_mid] + sgn * step) % n
-            bi = (ib[seed_mid] - sgn * step) % n
-            if np.linalg.norm(ca[ai] - map_b(bi)) <= gap_mm:
-                pair_a.append((step, sgn, ai, bi))
-    if len(pair_a) < 8:
-        return {"contact_mm": 0.0, "tmatch": 0.0, "gap": 99.0}
-    pair_a.sort(key=lambda z: z[0] * z[1])
-    Aidx = np.array([z[2] for z in pair_a])
-    Bidx = np.array([z[3] for z in pair_a])
-    mapped_b = map_b(Bidx)
+    seed = ia[len(ia) // 2]
+    seed_b = ib[len(ib) // 2]
+    chains = []
+    for da_, db_ in ((1, -1), (-1, 1)):
+        chain = []
+        for step in range(1, max_extend + 1):
+            ai = (seed + da_ * step) % n
+            bi = (seed_b + db_ * step) % n
+            if np.linalg.norm(ca[ai] - map_b(bi, R, center_b0)) > gap_mm:
+                break
+            chain.append((ai, bi))
+        chains.append(chain)
+    ordered = chains[1][::-1] + chains[0]
+    # 把种子窗口内的对应也纳入
+    seed_pairs = list(zip(ia.tolist(), ib.tolist()))
+    all_pairs = ordered + seed_pairs
+    if len(ordered) < 6 or len(all_pairs) < 12:
+        return {"contact_mm": 0.0, "seam_rmse": 99.0, "gap": 99.0,
+                "wiggle": 0.0, "R2": R, "center_b": center_b0}
+    Aidx = np.array([p[0] for p in all_pairs])
+    Bidx = np.array([p[1] for p in all_pairs])
+    # 整段重拟合
+    refit = fit_transform(ca[Aidx], cb[Bidx])
+    R2 = refit["R"]
+    center_b2 = cb[Bidx].mean(axis=0)
+    mapped_b = map_b(Bidx, R2, center_b2)
     gap = float(np.linalg.norm(ca[Aidx] - mapped_b, axis=1).mean())
-    seg = np.linalg.norm(np.diff(np.vstack([mapped_b, mapped_b[:1]]), axis=0),
-                         axis=1)
-    contact = float(seg.sum())
-
-    def turning(poly, idx, reverse=False):
-        k = np.arange(len(idx))
-        v0 = poly[idx[(k - 3) % len(idx)]] - poly[idx[k]]
-        v1 = poly[idx[(k + 3) % len(idx)]] - poly[idx[k]]
-        ang = np.arctan2(np.cross(v0, v1), (v0 * v1).sum(axis=1))
-        return -ang if reverse else ang
-
-    ua = turning(ca, Aidx)
-    local = np.arange(len(mapped_b))
-    ub = turning(mapped_b, local)
-    ua0, ub0 = ua - ua.mean(), ub - ub.mean()
-    den = math.sqrt(float((ua0 ** 2).sum() * (ub0 ** 2).sum())) + 1e-12
-    tmatch = float((ua0 * ub0).sum() / den)
-    return {"contact_mm": contact, "tmatch": tmatch, "gap": gap}
+    seg = np.linalg.norm(np.roll(mapped_b, -1, axis=0) - mapped_b, axis=1)
+    contact = float(seg[:-1].sum())
+    tang = np.arctan2(np.gradient(mapped_b[:, 1]), np.gradient(mapped_b[:, 0]))
+    wiggle = float(np.degrees(np.abs(np.diff(np.unwrap(tang))).sum()))
+    return {"contact_mm": contact, "seam_rmse": refit["rmse"],
+            "gap": gap, "wiggle": wiggle, "R2": R2, "center_b": center_b2,
+            "Aidx": Aidx, "Bidx": Bidx, "mapped_b": mapped_b}
 
 
 def overlap_ratio(poly_a: np.ndarray, poly_b_mapped: np.ndarray) -> float:
@@ -223,7 +226,7 @@ def _window_ncc_matrix(ka: np.ndarray, kb: np.ndarray, win: int,
     ext = np.concatenate([G, G[: win - 1, :]], axis=0)
     cc = np.concatenate([np.zeros((1, n)), np.cumsum(ext, axis=0)], axis=0)
     starts = np.arange(n)
-    sp = cc[starts[:, None] + win, :] - cc[starts[:, None], :]  # sp[i, s]
+    sp = cc[starts + win, :] - cc[starts, :]          # sp[i, s]
     # 各起点/位移的窗口和与平方和
     SBa = sa_sum[:, None]
     SA2 = sa2[:, None]
@@ -372,10 +375,16 @@ def analyze_pair(fa: dict, fb: dict) -> dict | None:
         t_world = seam_center - cb[ib_orig].mean(axis=0) @ fit["R"].T
         # 有序参数对应上延伸验证真实接缝（偶然贴合的短弧通不过）
         sv = seam_verify(ca, cb, ia, ib_orig, fit["R"], seam_center)
-        if sv["contact_mm"] < 15.0 or sv["tmatch"] < 0.55 or sv["gap"] > 2.0:
+        # 整段接缝重拟合：接触长度、形状 RMSE、平均间隙
+        sv = seam_verify(ca, cb, ia, ib_orig, fit["R"], seam_center)
+        if (sv["contact_mm"] < 15.0 or sv["seam_rmse"] > 3.0
+                or sv["gap"] > 2.0 or sv["wiggle"] < 25.0):
             continue
-        # 整件重叠与切线反向只作旁证（seam_verify 已确认接触弧）
-        cb_mapped = (cb - cb[ib_orig].mean(axis=0)) @ fit["R"].T + seam_center
+        R2 = sv["R2"]
+        center_b2 = sv["center_b"]
+        t_world = seam_center - center_b2 @ R2.T
+        # 整件重叠只作旁证（seam_verify 已确认接触弧）
+        cb_mapped = (cb - center_b2) @ R2.T + seam_center
         ov = overlap_ratio(ca, cb_mapped)
         if ov > 0.30:
             continue
@@ -389,33 +398,33 @@ def analyze_pair(fa: dict, fb: dict) -> dict | None:
             thick_score = max(0.0, 1 - dt / 3.0)
         else:
             thick_score, dt = 0.5, -1.0
-        fit_score = max(0.0, 1 - fit["rmse"] / 4.0)
+        window_fit = max(0.0, 1 - fit["rmse"] / 4.0)
+        seam_fit = max(0.0, 1 - sv["seam_rmse"] / 3.0)
         overlap_score = max(0.0, 1 - ov / 0.25)
         opposition_score = max(0.0, (-opposition + 1) / 2)
-        contact_score = min(1.0, contact_mm / 40.0)
-        tmatch_score = max(0.0, sv["tmatch"])
-        score = (22 * w["ncc"] + 24 * fit_score +
-                 12 * color_score + 6 * thick_score +
+        contact_score = min(1.0, contact_mm / 50.0)
+        score = (18 * w["ncc"] + 14 * window_fit +
+                 24 * seam_fit + 12 * color_score + 6 * thick_score +
                  6 * overlap_score + 6 * opposition_score +
-                 10 * contact_score + 14 * tmatch_score)
+                 14 * contact_score)
         cand = {
             "score": round(float(score), 1),
             "ncc": w["ncc"], "rmse": round(fit["rmse"], 2),
+            "seam_rmse": round(sv["seam_rmse"], 2),
             "de": de if has_color else None,
             "thick_diff": round(dt, 2) if dt >= 0 else None,
             "overlap": round(ov, 3),
             "contact_mm": round(sv["contact_mm"], 1),
             "opposition": round(opposition, 2),
             "wiggle_deg": round(wiggle, 1),
-            "tangent_match": round(sv["tmatch"], 3),
             "seam_gap_mm": round(sv["gap"], 2),
-            "ia": ia.tolist(), "ib": ib_orig.tolist(),
-            "R": fit["R"].tolist(),
+            "ia": sv["Aidx"].tolist(), "ib": sv["Bidx"].tolist(),
+            "R": R2.tolist(),
             "t": t_world.tolist(),
             "seam_center_a": seam_center.tolist(),
-            "seam_center_b": cb[ib_orig].mean(axis=0).tolist(),
+            "seam_center_b": center_b2.tolist(),
             "reflected": fit["reflected"],
-            "run_points": w["run"],
+            "run_points": len(sv["Aidx"]),
         }
         if best is None or cand["score"] > best["score"]:
             best = cand
@@ -428,7 +437,8 @@ def build_reasons(c: dict, fa: dict, fb: dict) -> list[str]:
     reasons = [
         f"边缘曲率相关系数 {c['ncc']:.2f}（接缝弧长约 "
         f"{c['run_points'] / N * 100:.0f}% 周长）",
-        f"刚性配准接缝偏差 RMSE {c['rmse']:.2f} mm",
+        f"接缝刚性配准偏差 RMSE {c.get('seam_rmse', c['rmse'])} mm，"
+        f"接触长度约 {c.get('contact_mm', 0)} mm",
     ]
     if c["de"] is not None:
         reasons.append(f"邻接色带平均色差 ΔE {c['de']:.1f}（<15 较接近）")

@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>陶瓷碎片修复工作台</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- 启动页 -->
+<section id="home" class="home">
+  <div class="home-card">
+    <h1>陶瓷碎片修复工作台</h1>
+    <p class="sub">本地离线运行 · 图像分析由 OpenCV 在本机完成，不上传任何外部服务</p>
+    <div class="home-actions">
+      <button id="btn-new-project" class="primary">新建修复项目</button>
+    </div>
+    <h2>已有项目</h2>
+    <ul id="project-list" class="project-list"></ul>
+  </div>
+</section>
+
+<!-- 工作台 -->
+<section id="workspace" class="workspace hidden">
+  <header class="topbar">
+    <div class="topbar-left">
+      <button id="btn-back-home" title="返回首页">◀</button>
+      <input id="project-name" class="project-name" spellcheck="false">
+      <span id="project-meta" class="project-meta"></span>
+    </div>
+    <div class="topbar-right">
+      <label class="plan-box">复原方案
+        <select id="plan-select"></select>
+      </label>
+      <button id="btn-new-plan">另存方案</button>
+      <button id="btn-dup-plan">复制方案</button>
+      <button id="btn-match" class="primary">计算候选拼接</button>
+      <button id="btn-export">导出复原图</button>
+    </div>
+  </header>
+
+  <div class="main">
+    <!-- 左栏：碎片库 -->
+    <aside class="sidebar">
+      <div class="side-head">
+        <span>碎片清单 (<span id="frag-count">0</span>)</span>
+      </div>
+      <div class="upload-zone" id="upload-zone">
+        <div class="upload-row">
+          <label>面
+            <select id="upload-side">
+              <option value="front">正面</option>
+              <option value="back">反面</option>
+            </select>
+          </label>
+          <label>编号前缀
+            <input id="upload-prefix" value="S" maxlength="4" style="width:46px">
+          </label>
+        </div>
+        <input type="file" id="file-input" accept="image/*" multiple hidden>
+        <button id="btn-upload">批量上传照片…</button>
+        <p class="hint">可多选；请保证照片内含标尺</p>
+        <div id="upload-progress" class="upload-progress hidden"></div>
+      </div>
+      <ul id="frag-list" class="frag-list"></ul>
+    </aside>
+
+    <!-- 中间：无限画布 -->
+    <div class="canvas-wrap" id="canvas-wrap">
+      <canvas id="board"></canvas>
+      <div class="canvas-hud">
+        <div class="hud-group">
+          <button id="btn-undo" title="撤销 (Ctrl+Z)">↶</button>
+          <button id="btn-redo" title="重做 (Ctrl+Y)">↷</button>
+          <button id="btn-zoom-out">−</button>
+          <span id="zoom-label">100%</span>
+          <button id="btn-zoom-in">＋</button>
+          <button id="btn-fit-view">适应</button>
+        </div>
+        <div class="hud-group">
+          <label class="snap-label"><input type="checkbox" id="snap-toggle" checked> 吸附</label>
+          <button id="btn-apply-cand" title="按候选几何关系摆放所选两件">按候选吸附</button>
+        </div>
+      </div>
+      <div class="canvas-help">左键拖动碎片 · 选中后 R/L 旋转 5°、F 翻面、Delete 收库 · 空白处拖动平移 · 滚轮缩放</div>
+      <div id="conflict-banner" class="conflict-banner hidden"></div>
+    </div>
+
+    <!-- 右栏：属性 / 候选 -->
+    <aside class="rightbar">
+      <div class="tabs">
+        <button class="tab active" data-tab="props">碎片属性</button>
+        <button class="tab" data-tab="cands">候选拼接 <span id="cand-count" class="badge">0</span></button>
+        <button class="tab" data-tab="metrics">方案指标</button>
+      </div>
+
+      <div class="tab-pane active" id="pane-props">
+        <div id="props-empty" class="empty-hint">从左侧或画布选择一件碎片</div>
+        <div id="props-body" class="hidden">
+          <label>碎片编号 <input id="f-code" maxlength="20"></label>
+          <div class="thick-row">
+            <label>厚度 (mm) <input id="f-thickness" type="number" step="0.1" min="0" style="width:90px"></label>
+          </div>
+          <label class="block">厚度记录说明
+            <input id="f-thickness-note" maxlength="200" placeholder="如：口沿 6.2 / 腹部 4.8">
+          </label>
+          <div class="metrics-grid" id="f-metrics"></div>
+          <div class="color-bands" id="f-bands"></div>
+          <div class="prop-actions">
+            <button id="btn-edit-image" class="primary">校准尺寸 / 去背景 / 修轮廓</button>
+          </div>
+          <p id="f-scale-info" class="hint"></p>
+        </div>
+      </div>
+
+      <div class="tab-pane" id="pane-cands">
+        <div class="cand-filter">
+          <label>显示
+            <select id="cand-filter">
+              <option value="all">全部候选</option>
+              <option value="pending">仅待定</option>
+              <option value="accepted">已接受</option>
+              <option value="excluded">已排除</option>
+            </select>
+          </label>
+        </div>
+        <ul id="cand-list" class="cand-list"></ul>
+      </div>
+
+      <div class="tab-pane" id="pane-metrics">
+        <button id="btn-refresh-metrics" class="primary">计算/刷新指标</button>
+        <div id="metrics-body" class="metrics-body"></div>
+      </div>
+    </aside>
+  </div>
+</section>
+
+<!-- 图像处理弹窗 -->
+<div id="editor-modal" class="modal hidden">
+  <div class="modal-card wide">
+    <div class="modal-head">
+      <h3 id="editor-title">碎片图像处理</h3>
+      <button id="editor-close">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="editor-tools">
+        <div class="tool-group">
+          <button class="tool active" data-tool="scale">① 标尺校准</button>
+          <button class="tool" data-tool="crop">② 裁剪重算</button>
+          <button class="tool" data-tool="contour">③ 修轮廓</button>
+        </div>
+        <div id="tool-options" class="tool-options"></div>
+      </div>
+      <div class="editor-stage">
+        <canvas id="editor-canvas"></canvas>
+      </div>
+      <div id="editor-status" class="editor-status"></div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="js/api.js"></script>
+<script src="js/editor.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
