@@ -122,8 +122,12 @@
               <option value="pending">仅待定</option>
               <option value="accepted">已接受</option>
               <option value="excluded">已排除</option>
+              <option value="unreviewed">未复核</option>
+              <option value="changed">分数有变化</option>
+              <option value="zones">含异常区段</option>
             </select>
           </label>
+          <button id="btn-print-all-sheets" title="把当前筛选结果逐一生成可打印核对单">批量核对单</button>
         </div>
         <ul id="cand-list" class="cand-list"></ul>
       </div>
@@ -161,8 +165,95 @@
 </div>
 
 <div id="toast" class="toast hidden"></div>
+
+<!-- 接缝人工复核与校正弹窗 -->
+<div id="review-modal" class="modal hidden">
+  <div class="modal-card review-card">
+    <div class="modal-head">
+      <h3 id="rv-title">接缝人工复核</h3>
+      <div class="rv-head-actions">
+        <button id="rv-btn-print">打印核对单</button>
+        <button id="rv-close">×</button>
+      </div>
+    </div>
+    <div class="review-body">
+      <div class="review-main">
+        <div class="rv-toolbar">
+          <div class="rv-layer-toggle" id="rv-layers">
+            <button data-layer="orig" class="active">原图</button>
+            <button data-layer="cutout">透明抠图</button>
+            <button data-layer="curve">曲率</button>
+            <button data-layer="lab">Lab 色带</button>
+          </div>
+          <div class="rv-sep"></div>
+          <div class="rv-modes" id="rv-modes">
+            <button data-mode="pan" class="active">平移</button>
+            <button data-mode="anchor">增/改锚点</button>
+            <button data-mode="zone">圈异常区段</button>
+          </div>
+          <select id="rv-zone-kind" title="异常区段类型">
+            <option value="wear">磨损</option>
+            <option value="fill">补配</option>
+            <option value="glare">反光</option>
+            <option value="other">其他</option>
+          </select>
+          <div class="rv-sep"></div>
+          <label class="rv-depth">边缘内探
+            <input id="rv-depth" type="range" min="20" max="160" value="70">
+            <span id="rv-depth-val">70px</span>
+          </label>
+          <button id="rv-zoom-in">＋</button>
+          <button id="rv-zoom-out">−</button>
+          <button id="rv-fit">同步适应</button>
+          <button id="rv-reset-anchors" title="放弃全部锚点调整，恢复自动对应">重置锚点</button>
+        </div>
+
+        <div class="rv-stage" id="rv-stage">
+          <canvas id="rv-canvas"></canvas>
+          <div id="rv-hint" class="rv-hint"></div>
+        </div>
+
+        <div class="rv-diffbar">
+          <div class="rv-thick" id="rv-thick"></div>
+          <div class="rv-metrics" id="rv-metrics"></div>
+          <div class="rv-save-state" id="rv-save-state"></div>
+        </div>
+      </div>
+
+      <aside class="review-side">
+        <div class="rv-side-sec">
+          <h4>指标对比（自动 → 当前）</h4>
+          <table class="rv-table" id="rv-table"></table>
+        </div>
+        <div class="rv-side-sec">
+          <h4>异常 / 不可信区段 <span id="rv-zone-n" class="badge">0</span></h4>
+          <ul id="rv-zone-list" class="rv-zone-list"></ul>
+        </div>
+        <div class="rv-side-sec rv-note-sec">
+          <h4>复核备注</h4>
+          <textarea id="rv-note" maxlength="500"
+            placeholder="磨损程度、补配痕迹、反光干扰、与实物核对情况…"></textarea>
+        </div>
+        <div class="rv-side-sec rv-actions">
+          <div class="rv-history">
+            <button id="rv-undo" title="撤销 (Ctrl+Z)">↶</button>
+            <button id="rv-redo" title="重做 (Ctrl+Y)">↷</button>
+          </div>
+          <div class="rv-decide">
+            <button id="rv-btn-accept" class="rv-accept">接受并吸附</button>
+            <button id="rv-btn-pending">待定</button>
+            <button id="rv-btn-exclude" class="rv-exclude">排除</button>
+          </div>
+          <button id="rv-btn-clear" class="rv-clear-link">清除人工调整，恢复自动候选</button>
+        </div>
+      </aside>
+    </div>
+  </div>
+</div>
+
 <script src="js/api.js"></script>
 <script src="js/editor.js"></script>
+<script src="js/review.js"></script>
 <script src="js/app.js"></script>
 </body>
 </html>

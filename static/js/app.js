@@ -11,6 +11,7 @@ const App = (() => {
     project: null,
     fragments: new Map(),
     candidates: new Map(),
+    reviews: new Map(),          // cid -> 当前方案的复核记录
     plans: [],
     activePlan: null,
     layout: {},                 // {fid: {x,y,rot,flip,placed}} 世界 mm / 度
@@ -31,6 +32,29 @@ const App = (() => {
 
   function frag(id) { return S.fragments.get(+id); }
   function cand(id) { return S.candidates.get(+id); }
+
+  // 候选在当前方案中的裁定（复核保存时已同步 decision，这里仅做兜底）
+  function candStatus(c) {
+    return S.decisions[c.id]?.status || 'pending';
+  }
+  // 生效参数：已接受复核用修正后的 ia/ib/R/t/接缝中心
+  function effParams(c) {
+    const rv = S.reviews.get(c.id);
+    if (rv?.status === 'accepted' && rv.result?.ok) {
+      const r = rv.result, p = { ...(c.params || {}) };
+      return {
+        ...p,
+        ia: r.ia, ib: r.ib, R: r.R, t: r.t,
+        seam_center_a: r.seam_center_a, seam_center_b: r.seam_center_b,
+        review_corrected: true,
+      };
+    }
+    return c.params || {};
+  }
+  function manualScore(c) {
+    const rv = S.reviews.get(c.id);
+    return rv?.result?.ok ? rv.result.score : null;
+  }
 
   function worldToScreen(x, y) {
     return [x * S.view.scale + S.view.ox, y * S.view.scale + S.view.oy];
@@ -83,6 +107,7 @@ const App = (() => {
     S.candidates = new Map(p.candidates.map(c => [c.id, c]));
     S.plans = p.plans;
     S.layout = {}; S.decisions = {}; S.selected = null;
+    S.reviews = new Map();
     S.undo = []; S.redo = [];
     $('home').classList.add('hidden');
     $('workspace').classList.remove('hidden');
@@ -302,6 +327,8 @@ const App = (() => {
     }
     const dec = await API.get(`/api/plans/${id}/decisions`);
     S.decisions = dec;
+    const rv = await API.get(`/api/plans/${id}/reviews`);
+    S.reviews = new Map((rv.reviews || []).map(r => [r.candidate_id, r]));
     renderPlanSelect();
     renderCandidates();
     renderMetricsPane();
@@ -349,6 +376,7 @@ const App = (() => {
   }
 
   window.addEventListener('keydown', (e) => {
+    if (modalOpen()) return;
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA'
         || e.target.tagName === 'SELECT') return;
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); return; }
@@ -476,7 +504,8 @@ const App = (() => {
     for (const c of S.candidates.values()) {
       const d = S.decisions[c.id];
       if (!d || d.status !== 'accepted') continue;
-      drawSeam(c, 'rgba(111,174,111,.9)');
+      const corrected = S.reviews.get(c.id)?.status === 'accepted';
+      drawSeam(c, corrected ? 'rgba(224,168,92,.95)' : 'rgba(111,174,111,.9)');
     }
     // 待定但刚计算的候选，仅在其两件都选中时高亮提示
   }
@@ -486,7 +515,7 @@ const App = (() => {
     if (!fa || !fb) return;
     const la = S.layout[c.frag_a], lb = S.layout[c.frag_b];
     if (!la || !lb) return;
-    const p = c.params || {};
+    const p = effParams(c);
     if (!p.ia || !p.R) return;
     const pts = p.ia.map((ia, k) => {
       const ib = p.ib[k];
@@ -551,8 +580,14 @@ const App = (() => {
     return inside;
   }
 
+  function modalOpen() {
+    return !$('editor-modal').classList.contains('hidden')
+      || !$('review-modal').classList.contains('hidden');
+  }
+
   // ---------------------------------------------------------------- 指针交互
   board.addEventListener('mousedown', (e) => {
+    if (modalOpen()) return;
     const rect = board.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     if (e.button === 1 || e.button === 2 || e.altKey) {
@@ -578,6 +613,8 @@ const App = (() => {
   });
 
   window.addEventListener('mousemove', (e) => {
+    if (!S.dragging && !S.panning) return;
+    if (modalOpen()) return;
     const rect = board.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
     if (S.panning) {
@@ -610,6 +647,7 @@ const App = (() => {
   board.addEventListener('contextmenu', e => e.preventDefault());
 
   board.addEventListener('wheel', (e) => {
+    if (modalOpen()) return;
     e.preventDefault();
     const rect = board.getBoundingClientRect();
     const mx = e.clientX - rect.left, my = e.clientY - rect.top;
@@ -684,8 +722,8 @@ const App = (() => {
       else if (c.frag_b === movingId) { other = c.frag_a; selfIsB = true; }
       if (other == null || !S.layout[other] || S.layout[other].placed === false) continue;
       // 比较两件接缝中心的当前距离
-      const p = c.params;
-      if (!p?.seam_center_a) continue;
+      const p = effParams(c);
+      if (!p.seam_center_a) continue;
       const pa = seamCenterWorld(c.frag_a, c, !selfIsB);
       const pb = seamCenterWorld(c.frag_b, c, selfIsB);
       const dist = Math.hypot(pa[0] - pb[0], pa[1] - pb[1]);
@@ -699,8 +737,9 @@ const App = (() => {
 
   function seamCenterWorld(fid, c, isMoving) {
     const f = frag(fid), l = S.layout[fid];
+    const p = effParams(c);
     const key = fid === c.frag_a ? 'seam_center_a' : 'seam_center_b';
-    const center = c.params[key];
+    const center = p[key];
     if (!center) return [l.x, l.y];
     // center 为分析时的图像系 mm 坐标；转为相对质心
     const mm = f.mm_per_px || 1;
@@ -716,8 +755,9 @@ const App = (() => {
     // 依据候选 R/t，把两件之一摆到另一件旁边：
     // q_b = (b_local) R^T + seam_center_a；再换算到各自布局坐标。
     const la = S.layout[c.frag_a], lb = S.layout[c.frag_b];
-    const R = c.params.R;
-    const a0 = c.params.seam_center_a, b0 = c.params.seam_center_b;
+    const R = effParams(c).R;
+    const p = effParams(c);
+    const a0 = p.seam_center_a, b0 = p.seam_center_b;
     // 期望 B 在世界系中的朝向：B 局部旋转 R（相对 A 分析坐标），
     // 这里采用“保持 A 当前位姿、推导 B 位姿”的近似刚体放置。
     const angB = Math.atan2(R[1][0], R[0][0]) * 180 / Math.PI;
@@ -780,34 +820,68 @@ const App = (() => {
   };
 
   // ---------------------------------------------------------------- 候选面板
+  function filteredCandidates(filter) {
+    return [...S.candidates.values()].filter(c => {
+      const status = candStatus(c);
+      const rv = S.reviews.get(c.id);
+      switch (filter) {
+        case 'pending': case 'accepted': case 'excluded':
+          return status === filter;
+        case 'unreviewed':
+          return !rv;
+        case 'changed': {
+          const ms = manualScore(c);
+          return ms != null && Math.abs(ms - c.score) >= 1;
+        }
+        case 'zones':
+          return (rv?.adjustments?.zones?.length || 0) > 0;
+        default:
+          return true;
+      }
+    }).sort((a, b) => b.score - a.score);
+  }
+
   function renderCandidates() {
     $('cand-count').textContent = S.candidates.size;
     const ul = $('cand-list');
     ul.innerHTML = '';
     const filter = $('cand-filter').value;
-    const list = [...S.candidates.values()]
-      .filter(c => filter === 'all' || (S.decisions[c.id]?.status || 'pending') === filter)
-      .sort((a, b) => b.score - a.score);
+    const list = filteredCandidates(filter);
     if (!list.length) {
       ul.innerHTML = '<div class="empty-hint">暂无候选，点击顶部“计算候选拼接”</div>';
       return;
     }
     for (const c of list) {
-      const status = S.decisions[c.id]?.status || 'pending';
+      const status = candStatus(c);
+      const rv = S.reviews.get(c.id);
       const li = document.createElement('li');
       li.className = `cand-item s-${status}` + (S.activeCandidate === c.id ? ' ring' : '');
       const m = c.metrics || {};
+      const ms = manualScore(c);
+      const scoreHtml = ms != null
+        ? `<span class="cand-score" title="自动分 ${c.score.toFixed(0)} → 人工 ${ms.toFixed(0)}">
+             <span class="auto-score">${c.score.toFixed(0)}</span>→<span class="manual">${ms.toFixed(0)}</span></span>`
+        : `<span class="cand-score">${c.score.toFixed(0)}</span>`;
+      const tag = rv
+        ? `<span class="cand-review-tag s-${rv.status}">${{
+          accepted: '✓ 复核接受', pending: '复核待定', excluded: '✕ 复核排除'
+        }[rv.status] || '已复核'}${rv.adjustments?.zones?.length ? ` · 异常×${rv.adjustments.zones.length}` : ''}</span>`
+        : '<span class="cand-review-tag">未复核</span>';
       li.innerHTML = `
         <div class="cand-head">
           <span class="cand-pair">#${c.id} ${escapeHtml(frag(c.frag_a)?.code || c.frag_a)}
             ⌇ ${escapeHtml(frag(c.frag_b)?.code || c.frag_b)}</span>
-          <span class="cand-score">${c.score.toFixed(0)}</span>
+          ${scoreHtml}
         </div>
         <ul class="cand-reasons">${(c.reasons || []).map(r => `<li>${escapeHtml(r)}</li>`).join('')}</ul>
         <div class="cand-actions">
           <button data-s="accepted" class="${status === 'accepted' ? 'on-accept' : ''}">接受</button>
-          <button data-s="pending" class="${status === 'pending' ? '' : ''}">待定</button>
+          <button data-s="pending">待定</button>
           <button data-s="excluded" class="${status === 'excluded' ? 'on-exclude' : ''}">排除</button>
+        </div>
+        <div class="cand-foot">
+          <button class="rv-entry primary">🔍 接缝人工复核</button>
+          ${tag}
         </div>`;
       li.onclick = (e) => {
         if (e.target.tagName === 'BUTTON') return;
@@ -815,14 +889,27 @@ const App = (() => {
         renderCandidates();
         selectCandidateHighlight(c);
       };
-      li.querySelectorAll('button').forEach(b => b.onclick = async (e) => {
+      li.querySelectorAll('.cand-actions button').forEach(b => b.onclick = async (e) => {
         e.stopPropagation();
         await setDecision(c.id, b.dataset.s);
       });
+      li.querySelector('.rv-entry').onclick = (e) => {
+        e.stopPropagation();
+        Review.open(c.id);
+      };
       ul.appendChild(li);
     }
   }
   $('cand-filter').onchange = renderCandidates;
+  $('btn-print-all-sheets').onclick = async () => {
+    const list = filteredCandidates($('cand-filter').value);
+    if (!list.length) return toast('当前筛选下没有候选');
+    toast(`正在生成 ${list.length} 份核对单…`, 2200);
+    for (const c of list) {
+      // 逐份打开检查器并触发打印（浏览器会合并到同一打印任务队列）
+      await Review.printSheet(c.id);
+    }
+  };
 
   function selectCandidateHighlight(c) {
     // 在画布上把两件都选中高亮（选 b 件），并提示接缝
@@ -834,6 +921,29 @@ const App = (() => {
   async function setDecision(cid, status) {
     await API.put(`/api/plans/${S.activePlan}/decisions/${cid}`, { status });
     S.decisions[cid] = { ...(S.decisions[cid] || {}), status };
+    renderCandidates();
+    requestDraw();
+    checkConflictsSoon();
+  }
+
+  // ---------------------------------------------------------------- 人工复核回调
+  async function onReviewSaved(cid, review, { snap = false } = {}) {
+    S.reviews.set(cid, review);
+    if (review.status) S.decisions[cid] = { status: review.status, note: review.note || '' };
+    renderCandidates();
+    const c = cand(cid);
+    if (c && review.status === 'accepted') {
+      ensurePlaced(c.frag_a); ensurePlaced(c.frag_b);
+      if (snap) snapToCandidate(c);   // 用修正后的变换吸附
+    }
+    requestDraw();
+    checkConflictsSoon();
+    renderMetricsPaneSoon();
+    if (snap) afterLayoutChange();
+  }
+  async function onReviewReset(cid) {
+    S.reviews.delete(cid);
+    if (S.decisions[cid]) S.decisions[cid] = { status: 'pending', note: '' };
     renderCandidates();
     requestDraw();
     checkConflictsSoon();
@@ -852,7 +962,7 @@ const App = (() => {
     if (!accepted.length) { banner.classList.add('hidden'); return; }
     try {
       const r = await API.post(`/api/projects/${S.project.id}/conflicts`,
-        { accepted_ids: accepted });
+        { accepted_ids: accepted, plan_id: S.activePlan });
       if (r.conflicts.length) {
         banner.innerHTML = '⚠ 检测到互相矛盾的拼接：<br>' +
           r.conflicts.slice(0, 3).map(x => escapeHtml(x.message)).join('<br>');
@@ -878,9 +988,10 @@ const App = (() => {
     try {
       const [m, cf] = await Promise.all([
         API.post(`/api/projects/${S.project.id}/metrics`,
-          { layout: S.layout, accepted_ids: accepted }),
+          { layout: S.layout, accepted_ids: accepted, plan_id: S.activePlan }),
         accepted.length
-          ? API.post(`/api/projects/${S.project.id}/conflicts`, { accepted_ids: accepted })
+          ? API.post(`/api/projects/${S.project.id}/conflicts`,
+            { accepted_ids: accepted, plan_id: S.activePlan })
           : Promise.resolve({ conflicts: [] }),
       ]);
       const body = $('metrics-body');
@@ -947,8 +1058,8 @@ const App = (() => {
     // 接缝与置信度
     for (const c of S.candidates.values()) {
       if (S.decisions[c.id]?.status !== 'accepted') continue;
-      const p = c.params;
-      if (!p?.ia || !p.R) continue;
+      const p = effParams(c);
+      if (!p.ia || !p.R) continue;
       // 用接缝中心两件世界位置的中点折线近似（与屏幕 drawSeam 相同策略）
       const la = S.layout[c.frag_a], lb = S.layout[c.frag_b];
       g.strokeStyle = 'rgba(40,120,60,.8)'; g.lineWidth = 2;
@@ -1008,5 +1119,14 @@ const App = (() => {
   loadHome();
   updateZoomLabel();
 
-  return { onFragmentChanged };
+  return {
+    onFragmentChanged,
+    context: () => ({
+      project: S.project, fragments: S.fragments, candidates: S.candidates,
+      reviews: S.reviews, plans: S.plans, activePlan: S.activePlan,
+      layout: S.layout, decisions: S.decisions,
+    }),
+    onReviewSaved,
+    onReviewReset,
+  };
 })();

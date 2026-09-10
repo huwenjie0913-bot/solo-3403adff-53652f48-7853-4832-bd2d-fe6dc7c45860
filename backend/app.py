@@ -65,6 +65,18 @@ def candidate_dict(r, status: str | None = None) -> dict:
     }
 
 
+def review_dict(r) -> dict:
+    return {
+        "id": r["id"], "plan_id": r["plan_id"],
+        "candidate_id": r["candidate_id"],
+        "status": r["status"], "note": r["note"],
+        "adjustments": _jload(r["adjustments"], {}),
+        "result": _jload(r["result"], {}),
+        "auto_snapshot": _jload(r["auto_snapshot"], {}),
+        "updated_at": r["updated_at"],
+    }
+
+
 # ---------------------------------------------------------------- 页面
 
 @app.get("/")
@@ -504,6 +516,13 @@ def duplicate_plan(plan_id):
         db.execute("INSERT INTO decision (plan_id, candidate_id, status, note) "
                    "VALUES (?,?,?,?)",
                    (new_id, d["candidate_id"], d["status"], d["note"]))
+    # 复核记录同样按方案复制（保留人工调整与重算结果）
+    for rv in db.execute("SELECT * FROM review WHERE plan_id=?", (plan_id,)):
+        db.execute(
+            "INSERT INTO review (plan_id, candidate_id, status, note, "
+            "adjustments, result, auto_snapshot) VALUES (?,?,?,?,?,?,?)",
+            (new_id, rv["candidate_id"], rv["status"], rv["note"],
+             rv["adjustments"], rv["result"], rv["auto_snapshot"]))
     db.commit()
     db.close()
     return jsonify({"id": new_id})
@@ -566,14 +585,45 @@ def get_decisions(plan_id):
 
 # ---------------------------------------------------------------- 指标
 
+def _accepted_review_params(db, plan_id) -> dict:
+    """本方案中已接受复核的修正变换（不覆盖候选，仅在使用处生效）。"""
+    if not plan_id:
+        return {}
+    out = {}
+    for r in db.execute(
+            "SELECT candidate_id, result FROM review WHERE plan_id=? "
+            "AND status='accepted'", (plan_id,)):
+        res = _jload(r["result"], {})
+        if res.get("ok"):
+            out[r["candidate_id"]] = res
+    return out
+
+
+def _effective_candidate(row, review_result: dict | None) -> dict:
+    """把已接受复核的 ia/ib/R/t/接缝中心覆盖到候选参数上（副本）。"""
+    d = dict(row)
+    if review_result:
+        p = _jload(row["params"], {})
+        p.update({
+            "ia": review_result["ia"], "ib": review_result["ib"],
+            "R": review_result["R"], "t": review_result["t"],
+            "seam_center_a": review_result["seam_center_a"],
+            "seam_center_b": review_result["seam_center_b"],
+            "review_corrected": True,
+        })
+        d["params"] = json.dumps(p, ensure_ascii=False)
+    return d
+
+
 @app.post("/api/projects/<int:pid>/metrics")
 def plan_metrics(pid):
-    """body: {layout:{fid:{x,y,rot,flip}}, accepted_ids:[...]}"""
+    """body: {layout:{fid:{x,y,rot,flip}}, accepted_ids:[...], plan_id?}"""
     body = request.get_json(force=True)
     db = get_db()
     frag_rows = db.execute("SELECT * FROM fragment WHERE project_id=?", (pid,)).fetchall()
     cands = {r["id"]: r for r in
              db.execute("SELECT * FROM candidate WHERE project_id=?", (pid,))}
+    overrides = _accepted_review_params(db, body.get("plan_id"))
     db.close()
     frags = {}
     for r in frag_rows:
@@ -585,23 +635,208 @@ def plan_metrics(pid):
                 if r["mm_per_px"] else pts,
                 "mm_per_px": r["mm_per_px"],
             }
-    accepted = [cands[i] for i in body.get("accepted_ids", []) if i in cands]
+    accepted = [_effective_candidate(cands[i], overrides.get(i))
+                for i in body.get("accepted_ids", []) if i in cands]
     metrics = compute_metrics(frags, body.get("layout") or {}, accepted)
     return jsonify(metrics)
 
 
 @app.post("/api/projects/<int:pid>/conflicts")
 def plan_conflicts(pid):
-    """body: {accepted_ids:[...]} —— 立即检测已接受候选间的矛盾。"""
+    """body: {accepted_ids:[...], plan_id?} —— 立即检测已接受候选间的矛盾。
+
+    已接受的人工复核会以修正后的 ia/ib/R 参与检测。
+    """
     body = request.get_json(force=True)
     db = get_db()
     frag_rows = db.execute("SELECT id FROM fragment WHERE project_id=?", (pid,)).fetchall()
     frags = {r["id"]: {"code": str(r["id"])} for r in frag_rows}
     cands = {r["id"]: r for r in
              db.execute("SELECT * FROM candidate WHERE project_id=?", (pid,))}
+    overrides = _accepted_review_params(db, body.get("plan_id"))
     db.close()
-    accepted = [cands[i] for i in body.get("accepted_ids", []) if i in cands]
+    accepted = [_effective_candidate(cands[i], overrides.get(i))
+                for i in body.get("accepted_ids", []) if i in cands]
     return jsonify({"conflicts": detect_conflicts(frags, accepted)})
+
+
+# ---------------------------------------------------------------- 接缝人工复核
+
+def _review_auto_snapshot(db, cand_row) -> dict:
+    """用当前候选参数重算一遍，作为“自动结果”基线快照。"""
+    fa = _load_feature(db, cand_row["frag_a"])
+    fb = _load_feature(db, cand_row["frag_b"])
+    params = _jload(cand_row["params"], {})
+    if not fa or not fb or not params.get("ia"):
+        return {"ok": False}
+    base = matcher.review_adjacency(params, len(fa["curve_mm"]),
+                                    len(fb["curve_mm"]))
+    res = matcher.review_recompute(fa, fb, params, {"anchors": base["anchors"]})
+    snap = res or {"ok": False}
+    snap["candidate_score"] = cand_row["score"]
+    snap["candidate_metrics"] = _jload(cand_row["metrics"], {})
+    return snap
+
+
+@app.get("/api/plans/<int:plan_id>/reviews")
+def list_reviews(plan_id):
+    db = get_db()
+    rows = db.execute("SELECT * FROM review WHERE plan_id=?",
+                      (plan_id,)).fetchall()
+    out = [review_dict(r) for r in rows]
+    db.close()
+    return jsonify({"reviews": out})
+
+
+@app.get("/api/plans/<int:plan_id>/reviews/<int:cid>")
+def get_review(plan_id, cid):
+    db = get_db()
+    cand = db.execute("SELECT * FROM candidate WHERE id=?", (cid,)).fetchone()
+    if not cand:
+        db.close()
+        return jsonify({"error": "候选不存在"}), 404
+    r = db.execute("SELECT * FROM review WHERE plan_id=? AND candidate_id=?",
+                   (plan_id, cid)).fetchone()
+    if not r:
+        # 首次打开：自动结果快照 + 默认锚点（不落库，保存时才写）
+        snap = _review_auto_snapshot(db, cand)
+        params = _jload(cand["params"], {})
+        fa_row = _get_fragment(db, cand["frag_a"])
+        n_a = len(_jload(fa_row["contour"], [])) if fa_row else matcher.N
+        adj = (matcher.review_adjacency(params, n_a, matcher.N)
+               if params.get("ia") else {"dir_b": 1, "anchors": []})
+        db.close()
+        return jsonify({"review": None, "auto_snapshot": snap,
+                        "default_adj": adj})
+    db.close()
+    return jsonify({"review": review_dict(r)})
+
+
+@app.post("/api/plans/<int:plan_id>/reviews/<int:cid>/recompute")
+def recompute_review(plan_id, cid):
+    """仅重算不落库：拖动锚点/区段时节流调用，返回实时指标。"""
+    body = request.get_json(force=True)
+    db = get_db()
+    cand = db.execute("SELECT * FROM candidate WHERE id=?", (cid,)).fetchone()
+    if not cand:
+        db.close()
+        return jsonify({"error": "候选不存在"}), 404
+    fa = _load_feature(db, cand["frag_a"])
+    fb = _load_feature(db, cand["frag_b"])
+    db.close()
+    params = _jload(cand["params"], {})
+    if not fa or not fb or not params.get("ia"):
+        return jsonify({"ok": False, "message": "缺少校准数据"}), 400
+    result = matcher.review_recompute(fa, fb, params,
+                                      body.get("adjustments") or {})
+    return jsonify(result or {"ok": False, "message": "有效接触点过少"})
+
+
+@app.put("/api/plans/<int:plan_id>/reviews/<int:cid>")
+def save_review(plan_id, cid):
+    """保存人工复核。body: {status, note, adjustments, recompute:true}
+
+    recompute 为真时按锚点/排除区段重算指标与修正变换；
+    调整结果以方案为单位存于 review 表，不修改原始候选。
+    """
+    body = request.get_json(force=True)
+    status = body.get("status", "pending")
+    if status not in ("accepted", "pending", "excluded"):
+        return jsonify({"error": "状态无效"}), 400
+    adjustments = body.get("adjustments") or {}
+    db = get_db()
+    cand = db.execute("SELECT * FROM candidate WHERE id=?", (cid,)).fetchone()
+    if not cand:
+        db.close()
+        return jsonify({"error": "候选不存在"}), 404
+    plan = db.execute("SELECT * FROM plan WHERE id=?", (plan_id,)).fetchone()
+    if not plan:
+        db.close()
+        return jsonify({"error": "方案不存在"}), 404
+
+    result = {}
+    if body.get("recompute", True):
+        fa = _load_feature(db, cand["frag_a"])
+        fb = _load_feature(db, cand["frag_b"])
+        params = _jload(cand["params"], {})
+        if not fa or not fb or not params.get("ia"):
+            db.close()
+            return jsonify({"error": "碎片缺少校准或轮廓，无法重算"}), 400
+        result = matcher.review_recompute(fa, fb, params, adjustments)
+        if not result or not result.get("ok"):
+            db.close()
+            return jsonify({"error": (result or {}).get("message",
+                                                        "有效接触点过少")}), 400
+
+    existing = db.execute("SELECT id FROM review WHERE plan_id=? AND candidate_id=?",
+                          (plan_id, cid)).fetchone()
+    note = str(body.get("note", ""))[:500]
+    if existing:
+        db.execute(
+            "UPDATE review SET status=?, note=?, adjustments=?, result=?, "
+            "updated_at=datetime('now','localtime') WHERE id=?",
+            (status, note, json.dumps(adjustments, ensure_ascii=False),
+             json.dumps(result, ensure_ascii=False), existing["id"]))
+    else:
+        snap = _review_auto_snapshot(db, cand)
+        db.execute(
+            "INSERT INTO review (plan_id, candidate_id, status, note, "
+            "adjustments, result, auto_snapshot) VALUES (?,?,?,?,?,?,?)",
+            (plan_id, cid, status, note,
+             json.dumps(adjustments, ensure_ascii=False),
+             json.dumps(result, ensure_ascii=False),
+             json.dumps(snap, ensure_ascii=False)))
+    # 同步方案裁定，使接受的复核直接参与画布与冲突检查
+    db.execute(
+        "INSERT INTO decision (plan_id, candidate_id, status, note) "
+        "VALUES (?,?,?,?) ON CONFLICT(plan_id, candidate_id) DO UPDATE SET "
+        "status=excluded.status, note=excluded.note",
+        (plan_id, cid, status, note))
+    db.commit()
+    row = db.execute("SELECT * FROM review WHERE plan_id=? AND candidate_id=?",
+                     (plan_id, cid)).fetchone()
+    db.close()
+    return jsonify({"review": review_dict(row), "result": result})
+
+
+@app.delete("/api/plans/<int:plan_id>/reviews/<int:cid>")
+def reset_review(plan_id, cid):
+    """放弃人工调整，恢复到自动候选状态（裁定回到待定）。"""
+    db = get_db()
+    db.execute("DELETE FROM review WHERE plan_id=? AND candidate_id=?",
+               (plan_id, cid))
+    db.execute(
+        "INSERT INTO decision (plan_id, candidate_id, status, note) "
+        "VALUES (?,?,'pending','') ON CONFLICT(plan_id, candidate_id) DO UPDATE SET "
+        "status='pending', note=''", (plan_id, cid))
+    db.commit()
+    cand = db.execute("SELECT * FROM candidate WHERE id=?", (cid,)).fetchone()
+    snap = _review_auto_snapshot(db, cand) if cand else {}
+    db.close()
+    return jsonify({"ok": True, "auto_snapshot": snap})
+
+
+@app.get("/api/reviews/<int:rid>/sheet-data")
+def review_sheet_data(rid):
+    """打印核对单所需的两侧边缘条带渲染数据。"""
+    db = get_db()
+    r = db.execute("SELECT * FROM review WHERE id=?", (rid,)).fetchone()
+    if not r:
+        db.close()
+        return jsonify({"error": "复核不存在"}), 404
+    cand = db.execute("SELECT * FROM candidate WHERE id=?",
+                      (r["candidate_id"],)).fetchone()
+    fa = _get_fragment(db, cand["frag_a"])
+    fb = _get_fragment(db, cand["frag_b"])
+    db.close()
+    result = _jload(r["result"], {})
+    return jsonify({
+        "review": review_dict(r),
+        "candidate": candidate_dict(cand),
+        "frag_a": fragment_dict(fa), "frag_b": fragment_dict(fb),
+        "ia_all": result.get("ia_all", _jload(cand["params"], {}).get("ia", [])),
+        "ib_all": result.get("ib_all", _jload(cand["params"], {}).get("ib", [])),
+    })
 
 
 if __name__ == "__main__":

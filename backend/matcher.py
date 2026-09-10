@@ -452,3 +452,197 @@ def build_reasons(c: dict, fa: dict, fb: dict) -> list[str]:
     if c["reflected"]:
         reasons.append("配准需要翻面（正反面），请人工核对")
     return reasons
+
+
+# ================================================================
+# 人工复核：按用户锚点与排除区段重新计算接缝指标
+# ================================================================
+
+REVIEW_U_STEPS = 160          # 复核条带上的对应采样数
+
+
+def _signed_span(i0: int, i1: int, n: int) -> int:
+    """闭合轮廓上从 i0 到 i1 的最短有向步长（±n/2 以内）。"""
+    d = (i1 - i0) % n
+    return d - n if d > n / 2 else d
+
+
+def review_adjacency(params: dict, n_a: int, n_b: int) -> dict:
+    """由候选 params 推出初始接缝对应关系。
+
+    返回 {dir_b:±1, anchors:[{u, ia, ib}]}（u∈[0,1]，条带横坐标）。
+    """
+    ia0, ib0 = int(params["ia"][0]), int(params["ib"][0])
+    ia1, ib1 = int(params["ia"][-1]), int(params["ib"][-1])
+    da = _signed_span(ia0, ia1, n_a)
+    db = _signed_span(ib0, ib1, n_b)
+    dir_b = 1 if da * db >= 0 else -1
+    span_a = abs(da)
+    return {
+        "dir_b": dir_b,
+        "span_a": span_a,
+        "anchors": [
+            {"u": 0.0, "ia": ia0, "ib": ib0},
+            {"u": 1.0, "ia": ia1 % n_a, "ib": ib1 % n_b},
+        ],
+    }
+
+
+def _anchor_maps(anchors: list[dict], n_a: int, n_b: int,
+                 dir_b: int, span_a: int):
+    """按 u=0..1 返回每个采样点的 (ia 浮点, ib 浮点)。
+
+    端点之间以“展开的轮廓参数”线性插值（跨过 0 点也连续）。
+    """
+    u = np.linspace(0.0, 1.0, REVIEW_U_STEPS)
+    anchors = sorted(anchors, key=lambda a: a["u"])
+    ia_unw = np.empty(REVIEW_U_STEPS)
+    ib_unw = np.empty(REVIEW_U_STEPS)
+    for k in range(len(anchors) - 1):
+        a0, a1 = anchors[k], anchors[k + 1]
+        m = (u >= a0["u"]) & (u <= a1["u"])
+        t = np.clip((u[m] - a0["u"]) / max(a1["u"] - a0["u"], 1e-9), 0, 1)
+        ia_unw[m] = a0["ia"] + _signed_span(a0["ia"], a1["ia"], n_a) * t
+        ib_unw[m] = a0["ib"] + _signed_span(a0["ib"], a1["ib"], n_b) * t
+    return u, ia_unw, ib_unw
+
+
+def _point_at(ca: np.ndarray, idx_float: np.ndarray) -> np.ndarray:
+    """闭合折线上按浮点下标线性取点。"""
+    n = len(ca)
+    i0 = np.floor(idx_float).astype(int)
+    t = (idx_float - i0)[:, None]
+    return ca[i0 % n] * (1 - t) + ca[(i0 + 1) % n] * t
+
+
+def _excluded_mask(u: np.ndarray, zones: list[dict]) -> np.ndarray:
+    out = np.zeros(len(u), dtype=bool)
+    for z in zones or []:
+        z0, z1 = float(z.get("u0", 0)), float(z.get("u1", 0))
+        lo, hi = min(z0, z1), max(z0, z1)
+        out |= (u >= lo) & (u <= hi)
+    return out
+
+
+def review_recompute(fa: dict, fb: dict, params: dict,
+                     adjustments: dict) -> dict | None:
+    """按人工调整重算接缝。
+
+    adjustments: {anchors:[{u,ia,ib}], zones:[{u0,u1,kind,note}], dir_b?}
+    返回有效接触长度、配准偏差、色差、曲率相关、综合分与修正后的 B→A 变换。
+    """
+    ca = np.asarray(fa["curve_mm"], dtype=np.float64)
+    cb = np.asarray(fb["curve_mm"], dtype=np.float64)
+    n_a, n_b = len(ca), len(cb)
+    base = review_adjacency(params, n_a, n_b)
+    anchors = adjustments.get("anchors") or base["anchors"]
+    dir_b = int(adjustments.get("dir_b", base["dir_b"]))
+    span_a = base["span_a"]
+
+    u, iaf, ibf = _anchor_maps(anchors, n_a, n_b, dir_b, span_a)
+    pa = _point_at(ca, iaf)
+    pb = _point_at(cb, ibf)
+
+    excluded = _excluded_mask(u, adjustments.get("zones"))
+    valid = ~excluded
+    # 排除区段过短时也保证至少可拟合
+    if valid.sum() < 6:
+        return {"ok": False, "message": "有效接触点过少（至少保留约 3% 接缝）",
+                "valid_ratio": round(float(valid.mean()), 3)}
+
+    fit = fit_transform(pa[valid], pb[valid])
+    R, t = fit["R"], fit["t"]
+    pb_map = pb @ R.T + t
+
+    gaps = np.linalg.norm(pa - pb_map, axis=1)
+    contact_gap = 2.0
+    near = valid & (gaps < contact_gap)
+    seg_a = np.linalg.norm(np.roll(pa, -1, axis=0) - pa, axis=1)
+    contact_mm = float(seg_a[near].sum())
+    valid_mm = float(seg_a[valid].sum())
+    rmse_valid = float(np.sqrt((gaps[valid] ** 2).mean()))
+    gap_valid = float(gaps[valid].mean())
+
+    # Lab 色差（按最近轮廓点取带内采样）
+    el_a, el_b = fa.get("edge_lab"), fb.get("edge_lab")
+    if el_a is not None and el_b is not None and len(el_a) == n_a and len(el_b) == n_b:
+        la = np.asarray(el_a)[np.rint(iaf).astype(int) % n_a]
+        lb = np.asarray(el_b)[np.rint(ibf).astype(int) % n_b]
+        de_all = np.linalg.norm(la - lb, axis=1)
+        de = float(de_all[valid].mean())
+    else:
+        de = None
+
+    # 曲率相关（有效点上的 NCC；ib 反向时取反向轮廓的曲率）
+    ka, kb = derive(ca)["kappa"], derive(cb)["kappa"]
+    ia_near = np.rint(iaf).astype(int) % n_a
+    ib_near = np.rint(ibf).astype(int) % n_b
+    va = ka[ia_near][valid]
+    vb = (kb[ib_near] if dir_b == 1 else kb[(-ib_near) % n_b])[valid]
+    a0, b0 = va - va.mean(), vb - vb.mean()
+    denom = math.sqrt(float((a0 ** 2).sum() * (b0 ** 2).sum())) + 1e-9
+    ncc = float(np.dot(a0, b0) / denom)
+
+    # 整件重叠 / 反对向（沿用自动分析的旁证）
+    # B→A 世界变换：q = p @ R.T + t
+    cb_mapped = cb @ R.T + t
+    ov = overlap_ratio(ca, cb_mapped)
+    _, opposition, _ = contact_stats(ca, cb_mapped, gap_mm=2.5)
+
+    thick_a, thick_b = float(fa.get("thickness") or 0), float(fb.get("thickness") or 0)
+    if thick_a and thick_b:
+        dt = abs(thick_a - thick_b)
+        thick_score = max(0.0, 1 - dt / 3.0)
+    else:
+        thick_score, dt = 0.5, -1.0
+
+    color_score = max(0.0, min(1.0, 1 - de / 25.0)) if de is not None else 0.5
+    seam_fit = max(0.0, 1 - rmse_valid / 3.0)
+    overlap_score = max(0.0, 1 - ov / 0.25)
+    opposition_score = max(0.0, (-opposition + 1) / 2)
+    contact_score = min(1.0, contact_mm / 50.0)
+    ncc_score = max(0.0, (ncc + 1) / 2) if np.isfinite(ncc) else 0.5
+    # 有效区段占接缝的比例（异常区段越多越扣分）
+    valid_ratio = float(valid.mean())
+    score = (24 * seam_fit + 14 * contact_score + 16 * ncc_score +
+             16 * color_score + 8 * thick_score + 8 * overlap_score +
+             6 * opposition_score + 8 * valid_ratio)
+
+    ia_idx = ia_near
+    ib_idx = ib_near
+    if el_a is not None and el_b is not None:
+        la_all = np.asarray(el_a)[ia_idx]
+        lb_all = np.asarray(el_b)[ib_idx]
+    else:
+        la_all = lb_all = None
+    zone_de = []
+    for z in adjustments.get("zones") or []:
+        m = _excluded_mask(u, [z])
+        zone_de.append(round(float(np.linalg.norm(
+            la_all[m] - lb_all[m], axis=1).mean()), 1)
+            if la_all is not None and m.any() else None)
+
+    return {
+        "ok": True,
+        "score": round(float(score), 1),
+        "contact_mm": round(contact_mm, 1),
+        "valid_mm": round(valid_mm, 1),
+        "valid_ratio": round(valid_ratio, 3),
+        "rmse": round(rmse_valid, 2),
+        "gap_mm": round(gap_valid, 2),
+        "de": round(de, 2) if de is not None else None,
+        "ncc": round(ncc, 3),
+        "overlap": round(ov, 3),
+        "opposition": round(opposition, 2),
+        "thick_diff": round(dt, 2) if dt >= 0 else None,
+        "excluded_mm": round(float(seg_a[excluded].sum()), 1),
+        "R": R.tolist(), "t": t.tolist(),
+        "ia": ia_idx[valid].tolist(), "ib": ib_idx[valid].tolist(),
+        "ia_all": ia_idx.tolist(), "ib_all": ib_idx.tolist(),
+        "excluded": excluded.tolist(),
+        "seam_center_a": pa[valid].mean(axis=0).round(2).tolist(),
+        "seam_center_b": (pb[valid].mean(axis=0)).round(2).tolist(),
+        "reflected": bool(fit["reflected"]),
+        "zone_count": int(len(adjustments.get("zones") or [])),
+        "zone_de": zone_de,
+    }

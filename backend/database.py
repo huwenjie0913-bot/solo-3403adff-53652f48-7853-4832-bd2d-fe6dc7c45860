@@ -78,6 +78,20 @@ CREATE TABLE IF NOT EXISTS decision (
     updated_at  TEXT DEFAULT (datetime('now','localtime')),
     PRIMARY KEY (plan_id, candidate_id)
 );
+
+CREATE TABLE IF NOT EXISTS review (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id      INTEGER NOT NULL REFERENCES plan(id) ON DELETE CASCADE,
+    candidate_id INTEGER NOT NULL REFERENCES candidate(id) ON DELETE CASCADE,
+    status       TEXT NOT NULL DEFAULT 'pending',   -- accepted / pending / excluded
+    note         TEXT DEFAULT '',
+    adjustments  TEXT DEFAULT '{}',   -- 锚点、排除区段等人工作业内容
+    result       TEXT DEFAULT '{}',   -- 服务端重算的指标与修正变换
+    auto_snapshot TEXT DEFAULT '{}',  -- 复核开始时自动结果快照
+    created_at   TEXT DEFAULT (datetime('now','localtime')),
+    updated_at   TEXT DEFAULT (datetime('now','localtime')),
+    UNIQUE (plan_id, candidate_id)
+);
 """
 
 
