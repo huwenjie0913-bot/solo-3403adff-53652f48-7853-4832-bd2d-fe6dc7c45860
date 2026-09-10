@@ -24,6 +24,10 @@ const App = (() => {
     panning: null,
     dirtyLayout: false,
     undo: [], redo: [],
+    overlays: [],               // 装配规划等模块注册的画布叠加层
+    canvasTool: null,           // 当前画布标注工具（由装配模块设置）
+    ghostCheck: null,           // 装配播放时的碎片幽灵化判断 fn(fid)
+    planListeners: [],          // 方案切换后的回调（装配模块重载数据）
   };
   let saveTimer = null;
 
@@ -62,6 +66,20 @@ const App = (() => {
   function screenToWorld(x, y) {
     return [(x - S.view.ox) / S.view.scale, (y - S.view.oy) / S.view.scale];
   }
+
+  // ---------------------------------------------------------------- 右栏标签页
+  document.querySelectorAll('.tabs .tab').forEach(btn => {
+    btn.onclick = () => {
+      document.querySelectorAll('.tabs .tab').forEach(b =>
+        b.classList.toggle('active', b === btn));
+      document.querySelectorAll('.tab-pane').forEach(p =>
+        p.classList.toggle('active', p.id === 'pane-' + btn.dataset.tab));
+      if (btn.dataset.tab === 'metrics') refreshMetrics(false);
+      if (btn.dataset.tab === 'assembly' && window.Assembly) {
+        Assembly.onTabShown();
+      }
+    };
+  });
 
   // ---------------------------------------------------------------- 启动页
   async function loadHome() {
@@ -247,6 +265,11 @@ const App = (() => {
     $('f-code').value = f.code;
     $('f-thickness').value = f.thickness || '';
     $('f-thickness-note').value = f.thickness_note || '';
+    $('f-weight').value = f.weight_g || '';
+    $('f-weight-hint').textContent = f.weight_g
+      ? '' : (f.features?.area_mm2
+        ? `未补录，装配规划按面积×厚度估算约 ${(f.features.area_mm2 * (f.thickness || 5) * 0.0024).toFixed(0)} g`
+        : '未补录，装配规划将估算');
     const ft = f.features || {};
     $('f-scale-info').textContent = f.mm_per_px
       ? `校准：${f.scale_mm} mm = ${f.scale_px?.toFixed(0)} px（1px=${f.mm_per_px.toFixed(4)}mm）`
@@ -295,6 +318,13 @@ const App = (() => {
   }
   $('f-thickness').onchange = saveThickness;
   $('f-thickness-note').onchange = saveThickness;
+  $('f-weight').onchange = async () => {
+    const f = frag(S.selected); if (!f) return;
+    f.weight_g = parseFloat($('f-weight').value) || 0;
+    await API.post(`/api/fragments/${f.id}/weight`, { weight_g: f.weight_g });
+    renderProps();
+    if (window.Assembly) Assembly.onTabShown();
+  };
   $('btn-edit-image').onclick = () => {
     const f = frag(S.selected);
     if (f) Editor.open(f);
@@ -333,6 +363,9 @@ const App = (() => {
     renderCandidates();
     renderMetricsPane();
     requestDraw();
+    for (const fn of S.planListeners) {
+      try { fn(); } catch (e) { console.warn('plan listener', e); }
+    }
   }
 
   $('btn-new-plan').onclick = async () => {
@@ -442,6 +475,9 @@ const App = (() => {
       if (!l || l.placed === false) continue;
       drawFragment(f, l);
     }
+    for (const fn of S.overlays) {
+      try { fn(bctx); } catch (e) { console.warn('overlay', e); }
+    }
   }
 
   function drawGrid(W, H) {
@@ -459,7 +495,9 @@ const App = (() => {
   function drawFragment(f, l) {
     const [sx, sy] = worldToScreen(l.x, l.y);
     const img = S.images.get(f.id);
+    const ghosted = S.ghostCheck ? !!S.ghostCheck(f.id) : false;
     bctx.save();
+    if (ghosted) bctx.globalAlpha = 0.12;   // 装配播放：尚未装到的碎片
     bctx.translate(sx, sy);
     bctx.rotate(l.rot * Math.PI / 180);
     bctx.scale(l.flip ? -1 : 1, 1);
@@ -496,7 +534,8 @@ const App = (() => {
     bctx.restore();
     // 编号始终正向显示
     bctx.font = '12px sans-serif';
-    bctx.fillStyle = S.selected === f.id ? '#ffd35c' : '#cfd6df';
+    bctx.fillStyle = ghosted ? 'rgba(207,214,223,.3)'
+      : S.selected === f.id ? '#ffd35c' : '#cfd6df';
     bctx.fillText(f.code, sx + 4, sy - 4);
   }
 
@@ -590,6 +629,9 @@ const App = (() => {
     if (modalOpen()) return;
     const rect = board.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+    // 装配规划等模块的画布标注工具优先
+    if (S.canvasTool && S.canvasTool.mousedown
+        && S.canvasTool.mousedown(e, sx, sy)) return;
     if (e.button === 1 || e.button === 2 || e.altKey) {
       S.panning = { x: sx, y: sy, ox: S.view.ox, oy: S.view.oy };
       board.classList.add('dragging');
@@ -613,10 +655,12 @@ const App = (() => {
   });
 
   window.addEventListener('mousemove', (e) => {
-    if (!S.dragging && !S.panning) return;
     if (modalOpen()) return;
     const rect = board.getBoundingClientRect();
     const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+    if (S.canvasTool && S.canvasTool.mousemove
+        && S.canvasTool.mousemove(e, sx, sy)) return;
+    if (!S.dragging && !S.panning) return;
     if (S.panning) {
       S.view.ox = S.panning.ox + (sx - S.panning.x);
       S.view.oy = S.panning.oy + (sy - S.panning.y);
@@ -636,7 +680,10 @@ const App = (() => {
     }
   });
 
-  window.addEventListener('mouseup', () => {
+  window.addEventListener('mouseup', (e) => {
+    if (S.canvasTool && S.canvasTool.mouseup && S.canvasTool.mouseup(e)) {
+      return;
+    }
     if (S.dragging) {
       if (!S.dragging.moved && S.undo.length) S.undo.pop();
       afterLayoutChange(true);
@@ -1128,5 +1175,20 @@ const App = (() => {
     }),
     onReviewSaved,
     onReviewReset,
+    // —— 装配规划模块钩子 ——
+    registerOverlay: (fn) => S.overlays.push(fn),
+    setCanvasTool: (tool) => {
+      S.canvasTool = tool;
+      board.style.cursor = tool ? 'crosshair' : '';
+    },
+    getCanvasTool: () => S.canvasTool,
+    setGhostCheck: (fn) => { S.ghostCheck = fn; requestDraw(); },
+    onPlanChanged: (fn) => S.planListeners.push(fn),
+    worldToScreen, screenToWorld, requestDraw,
+    contourPointWorld, fragRadiusMm, rotatePt, effParams, hitTest,
+    imageFor: (id) => S.images.get(+id),
+    selectFragment,
+    saveLayoutNow: saveLayout,
+    escapeHtml,
   };
 })();

@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from database import get_db, init_db
 import vision
 import matcher
+import planner
 from metrics import compute_metrics, detect_conflicts
 
 app = Flask(__name__, static_folder="../static", static_url_path="")
@@ -47,6 +48,7 @@ def fragment_dict(r) -> dict:
         "thumb_url": f"/api/thumb/{r['id']}" if r["thumb_path"] else None,
         "cutout_url": f"/api/cutout/{r['id']}" if r["mask_path"] else None,
         "thickness": r["thickness"], "thickness_note": r["thickness_note"],
+        "weight_g": r["weight_g"] if "weight_g" in r.keys() else 0,
         "color_bands": _jload(r["color_bands"], []),
         "features": _jload(r["features"], {}),
         "created_at": r["created_at"],
@@ -258,6 +260,18 @@ def set_thickness(fid):
     db.execute("UPDATE fragment SET thickness=?, thickness_note=? WHERE id=?",
                (float(data.get("thickness") or 0),
                 str(data.get("note", ""))[:200], fid))
+    db.commit()
+    db.close()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/fragments/<int:fid>/weight")
+def set_weight(fid):
+    """补录碎片实测重量（克）；0 表示清除，回到按面积×厚度估算。"""
+    data = request.get_json(force=True)
+    db = get_db()
+    db.execute("UPDATE fragment SET weight_g=? WHERE id=?",
+               (max(0.0, float(data.get("weight_g") or 0)), fid))
     db.commit()
     db.close()
     return jsonify({"ok": True})
@@ -523,6 +537,12 @@ def duplicate_plan(plan_id):
             "adjustments, result, auto_snapshot) VALUES (?,?,?,?,?,?,?)",
             (new_id, rv["candidate_id"], rv["status"], rv["note"],
              rv["adjustments"], rv["result"], rv["auto_snapshot"]))
+    # 装配规划随方案复制
+    ap = db.execute("SELECT data FROM assembly_plan WHERE plan_id=?",
+                    (plan_id,)).fetchone()
+    if ap:
+        db.execute("INSERT INTO assembly_plan (plan_id, data) VALUES (?,?)",
+                   (new_id, ap["data"]))
     db.commit()
     db.close()
     return jsonify({"id": new_id})
@@ -837,6 +857,100 @@ def review_sheet_data(rid):
         "ia_all": result.get("ia_all", _jload(cand["params"], {}).get("ia", [])),
         "ib_all": result.get("ib_all", _jload(cand["params"], {}).get("ib", [])),
     })
+
+
+# ---------------------------------------------------------------- 装配次序与临时支撑规划
+
+def _assembly_frags(db, pid) -> dict:
+    """规划所需的碎片几何与物理量（轮廓 px、质心、厚度、重量）。"""
+    out = {}
+    for r in db.execute("SELECT * FROM fragment WHERE project_id=?", (pid,)):
+        contour = _jload(r["contour"], [])
+        if len(contour) < 3:
+            continue
+        feats = _jload(r["features"], {})
+        out[r["id"]] = {
+            "code": r["code"],
+            "contour": contour,
+            "centroid_px": feats.get("centroid_px") or [0.0, 0.0],
+            "mm_per_px": r["mm_per_px"] or 0.0,
+            "thickness": r["thickness"] or 0.0,
+            "weight_g": r["weight_g"] if "weight_g" in r.keys() else 0.0,
+            "area_mm2": feats.get("area_mm2") or 0.0,
+        }
+    return out
+
+
+def _accepted_seam_rows(db, plan) -> list:
+    """本方案已接受接缝（含人工复核修正后的 ia/ib/R/t）。"""
+    pid = plan["project_id"]
+    cands = {r["id"]: r for r in
+             db.execute("SELECT * FROM candidate WHERE project_id=?", (pid,))}
+    accepted_ids = [r["candidate_id"] for r in db.execute(
+        "SELECT candidate_id FROM decision WHERE plan_id=? AND status='accepted'",
+        (plan["id"],))]
+    overrides = _accepted_review_params(db, plan["id"])
+    return [_effective_candidate(cands[i], overrides.get(i))
+            for i in accepted_ids if i in cands]
+
+
+@app.get("/api/plans/<int:plan_id>/assembly")
+def get_assembly(plan_id):
+    db = get_db()
+    row = db.execute("SELECT * FROM assembly_plan WHERE plan_id=?",
+                     (plan_id,)).fetchone()
+    db.close()
+    return jsonify({"data": _jload(row["data"], {}) if row else {},
+                    "updated_at": row["updated_at"] if row else None})
+
+
+@app.put("/api/plans/<int:plan_id>/assembly")
+def save_assembly(plan_id):
+    """保存装配规划（托点/禁入区/先后关系/接缝参数/步骤锁定与上次结果）。
+
+    只写 assembly_plan，不改 plan_state 布局与 decision 裁定。
+    """
+    data = request.get_json(force=True)
+    payload = json.dumps(data.get("data") or {}, ensure_ascii=False)
+    db = get_db()
+    db.execute(
+        "INSERT INTO assembly_plan (plan_id, data) VALUES (?,?) "
+        "ON CONFLICT(plan_id) DO UPDATE SET data=excluded.data, "
+        "updated_at=datetime('now','localtime')", (plan_id, payload))
+    db.commit()
+    db.close()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/plans/<int:plan_id>/assembly/recompute")
+def recompute_assembly(plan_id):
+    """重算装配次序（只计算不落库，由前端随后整体保存）。
+
+    body: {layout?, seams, supports, zones, relations, order, locked}
+    """
+    body = request.get_json(force=True)
+    db = get_db()
+    plan = db.execute("SELECT * FROM plan WHERE id=?", (plan_id,)).fetchone()
+    if not plan:
+        db.close()
+        return jsonify({"error": "方案不存在"}), 404
+    frags = _assembly_frags(db, plan["project_id"])
+    rows = _accepted_seam_rows(db, plan)
+    st = db.execute("SELECT layout FROM plan_state WHERE plan_id=?",
+                    (plan_id,)).fetchone()
+    db.close()
+    saved_layout = _jload(st["layout"], {}) if st else {}
+    layout = body.get("layout") or saved_layout
+    layout = {int(k): v for k, v in layout.items()}
+    seams = []
+    for row in rows:
+        row = dict(row)
+        row["params"] = _jload(row["params"], {})
+        g = planner.seam_geometry(frags, layout, row)
+        if g:
+            seams.append(g)
+    result = planner.compute_assembly(frags, layout, seams, body)
+    return jsonify(result)
 
 
 if __name__ == "__main__":

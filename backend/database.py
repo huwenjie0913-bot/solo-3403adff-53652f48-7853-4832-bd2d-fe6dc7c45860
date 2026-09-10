@@ -92,7 +92,21 @@ CREATE TABLE IF NOT EXISTS review (
     updated_at   TEXT DEFAULT (datetime('now','localtime')),
     UNIQUE (plan_id, candidate_id)
 );
+
+-- 装配次序与临时支撑规划（随复原方案保存；不改布局与接缝裁定）
+CREATE TABLE IF NOT EXISTS assembly_plan (
+    plan_id    INTEGER PRIMARY KEY REFERENCES plan(id) ON DELETE CASCADE,
+    data       TEXT DEFAULT '{}',   -- 接缝胶粘参数、托点、禁入区、先后关系、步骤锁定与上次结果
+    updated_at TEXT DEFAULT (datetime('now','localtime'))
+);
 """
+
+
+def _ensure_column(conn, table: str, column: str, ddl: str) -> None:
+    """老库平滑升级：缺列时 ALTER TABLE 补上。"""
+    cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
 def init_db() -> None:
@@ -100,6 +114,7 @@ def init_db() -> None:
     conn = get_db()
     try:
         conn.executescript(SCHEMA)
+        _ensure_column(conn, "fragment", "weight_g", "weight_g REAL DEFAULT 0")
         conn.commit()
     finally:
         conn.close()

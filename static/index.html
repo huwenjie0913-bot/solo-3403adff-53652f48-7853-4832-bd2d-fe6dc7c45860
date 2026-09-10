@@ -93,6 +93,7 @@
         <button class="tab active" data-tab="props">碎片属性</button>
         <button class="tab" data-tab="cands">候选拼接 <span id="cand-count" class="badge">0</span></button>
         <button class="tab" data-tab="metrics">方案指标</button>
+        <button class="tab" data-tab="assembly">装配规划</button>
       </div>
 
       <div class="tab-pane active" id="pane-props">
@@ -101,7 +102,9 @@
           <label>碎片编号 <input id="f-code" maxlength="20"></label>
           <div class="thick-row">
             <label>厚度 (mm) <input id="f-thickness" type="number" step="0.1" min="0" style="width:90px"></label>
+            <label>重量 (g) <input id="f-weight" type="number" step="0.1" min="0" style="width:90px"></label>
           </div>
+          <p id="f-weight-hint" class="hint"></p>
           <label class="block">厚度记录说明
             <input id="f-thickness-note" maxlength="200" placeholder="如：口沿 6.2 / 腹部 4.8">
           </label>
@@ -135,6 +138,49 @@
       <div class="tab-pane" id="pane-metrics">
         <button id="btn-refresh-metrics" class="primary">计算/刷新指标</button>
         <div id="metrics-body" class="metrics-body"></div>
+      </div>
+
+      <div class="tab-pane" id="pane-assembly">
+        <div class="asm-sec">
+          <h4>① 碎片重量（g）</h4>
+          <div id="asm-weights" class="asm-weights"></div>
+          <p class="hint">未补录的按 面积×厚度×陶瓷密度 估算，估算值带 ~ 标记。</p>
+        </div>
+        <div class="asm-sec">
+          <h4>② 接缝胶粘参数</h4>
+          <div id="asm-seams"></div>
+          <p class="hint">仅列出本方案已接受的接缝；开放时间为可调整窗口，固化时间为可承载前等待。</p>
+        </div>
+        <div class="asm-sec">
+          <h4>③ 画布标注</h4>
+          <div class="asm-tools">
+            <button data-asm-tool="support">▲ 标托点</button>
+            <button data-asm-tool="temp">△ 临时支撑</button>
+            <button data-asm-tool="zone">▦ 夹具禁入区</button>
+            <button data-asm-tool="relation">⇢ 先后关系</button>
+          </div>
+          <p class="hint" id="asm-tool-hint">选择工具后在画布上操作；Esc 退出工具。</p>
+          <div id="asm-anno-list"></div>
+        </div>
+        <div class="asm-sec">
+          <button id="asm-compute" class="primary">生成 / 重算装配方案</button>
+          <div id="asm-status" class="asm-status"></div>
+        </div>
+        <div class="asm-sec hidden" id="asm-steps-sec">
+          <h4>④ 装配步骤 <span class="hint">（可拖动换序，🔒 锁定）</span></h4>
+          <div class="asm-play">
+            <button id="asm-play" title="播放各步装配">▶</button>
+            <button id="asm-prev" title="上一步">⏮</button>
+            <button id="asm-next" title="下一步">⏭</button>
+            <input id="asm-step-slider" type="range" min="0" max="0" value="0">
+            <span id="asm-step-label" class="asm-step-label"></span>
+          </div>
+          <ul id="asm-steps" class="asm-steps"></ul>
+        </div>
+        <div class="asm-sec">
+          <button id="asm-print" class="primary">打印装配操作单</button>
+          <p class="hint">含步骤图、夹具位置、等待节点与风险提示；规划随方案自动保存。</p>
+        </div>
       </div>
     </aside>
   </div>
@@ -255,5 +301,6 @@
 <script src="js/editor.js"></script>
 <script src="js/review.js"></script>
 <script src="js/app.js"></script>
+<script src="js/assembly.js"></script>
 </body>
 </html>
